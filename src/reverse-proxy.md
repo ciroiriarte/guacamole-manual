@@ -443,3 +443,174 @@ Note that if you are serving Guacamole under a path different from
 `/guacamole/`, you will need to change the value of `Request_URI` above
 accordingly.
 
+(wan-tuning)=
+
+Tuning the reverse proxy for WAN / high-latency links
+-----------------------------------------------------
+
+The reverse proxy examples above are tuned for *correctness* on a local
+network. When your users connect over the public Internet or any other
+high-latency, lossy link, the reverse proxy is the *WAN edge* of the
+deployment: the only hop between the browser and the proxy crosses the WAN,
+while everything behind the proxy (the servlet container, guacd, and the
+machines being accessed) is assumed to be on a fast local network.
+
+Because Guacamole's browser-to-server tunnel is relayed unmodified by the
+proxy, a handful of proxy-level settings can noticeably improve connection
+resilience and reduce bandwidth over such links. All of the settings below
+apply to the browser-to-proxy hop only.
+
+(wan-tuning-timeouts)=
+
+### Connection timeouts and keep-alive
+
+Guacamole sends stability-test pings over its tunnel roughly twice per second,
+but a quiet remote screen still produces long gaps with no application data. If
+the proxy's *idle read timeout* is shorter than the length of time a session
+may sit idle, the proxy will close the WebSocket before Guacamole would,
+producing a disconnect that the client cannot explain or recover from
+gracefully.
+
+Raise the proxy's read/send timeouts to at least the longest idle period you
+intend to support. For Nginx, add these directives to the Guacamole `location`
+block:
+
+:::{code-block} nginx
+:emphasize-lines: 8-10
+location /guacamole/ {
+    proxy_pass http://HOSTNAME:8080;
+    proxy_buffering off;
+    proxy_http_version 1.1;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_socket_keepalive on;
+    access_log off;
+}
+:::
+
+For Apache, add a `timeout` parameter to the WebSocket `ProxyPass` (the value is
+in seconds), and optionally raise the global `ProxyTimeout`:
+
+:::{code-block} apache
+:emphasize-lines: 4
+<Location /guacamole/websocket-tunnel>
+    Order allow,deny
+    Allow from all
+    ProxyPass ws://HOSTNAME:8080/guacamole/websocket-tunnel timeout=3600
+    ProxyPassReverse ws://HOSTNAME:8080/guacamole/websocket-tunnel
+</Location>
+:::
+
+:::{important}
+Guacamole's own ping traffic keeps the connection alive while a session is
+*active*, but it cannot keep it alive across an idle screen indefinitely. Set
+the proxy idle timeout to at least the longest idle session you want to
+survive; otherwise the proxy, not Guacamole, decides when the session drops.
+:::
+
+(wan-tuning-compression)=
+
+### WebSocket compression
+
+The data carried over the Guacamole tunnel is a stream of text instructions
+that compresses very well, so compression can substantially reduce the volume
+of data crossing the WAN. Two points are important when a reverse proxy is
+involved:
+
+1. Compression of the tunnel happens at the *WebSocket* layer, using the
+   `permessage-deflate` extension negotiated between the browser and the
+   servlet container. HTTP-level compression such as `gzip` or `brotli`
+   configured on the proxy does **not** apply to WebSocket frames once the
+   connection has been upgraded, and enabling it for the tunnel location has no
+   effect on tunnel bandwidth.
+
+2. For `permessage-deflate` to be used, the proxy must forward the
+   `Sec-WebSocket-Extensions` request/response headers unchanged. Nginx and
+   Apache `mod_proxy_wstunnel` both relay WebSocket frames and handshake headers
+   transparently and do not strip this extension by default, but if you place
+   an additional security appliance or WAF in the path you should verify — for
+   example with a browser network capture — that the negotiated
+   `Sec-WebSocket-Extensions: permessage-deflate` header survives end to end.
+
+:::{note}
+Whether the tunnel is actually compressed also depends on the servlet
+container's WebSocket implementation supporting and enabling
+`permessage-deflate`. Enabling it there is outside the scope of the proxy, but
+the proxy must not prevent it.
+:::
+
+(wan-tuning-http2)=
+
+### HTTP/2 and HTTP/3 for the web interface
+
+Enabling HTTP/2 — and HTTP/3 (QUIC) where your proxy supports it — on the
+proxy's TLS listener speeds up the initial load of the Guacamole web interface
+(its JavaScript, CSS, and fonts) and its REST API calls over high-latency
+links, where connection and request round-trips dominate.
+
+Note that the tunnel itself is a WebSocket connection established via an
+HTTP/1.1 `Upgrade`, so it continues to run over HTTP/1.1 regardless; HTTP/2 and
+HTTP/3 accelerate the application shell and management traffic, not the tunnel.
+Keep `proxy_http_version 1.1` (Nginx) on the tunnel location.
+
+For Nginx, enable HTTP/2 on the TLS server block:
+
+```nginx
+server {
+    listen 443 ssl;
+    http2 on;
+    # ... TLS and location configuration ...
+}
+```
+
+For Apache, advertise HTTP/2 alongside HTTP/1.1 (requires `mod_http2`):
+
+```apache
+Protocols h2 http/1.1
+```
+
+(wan-tuning-tls)=
+
+### TLS session resumption
+
+High-latency links reconnect often, and every fresh TLS handshake costs
+additional round-trips. Enabling TLS 1.3 together with session resumption
+reduces the handshake cost of reconnecting, which pairs well with Guacamole's
+reconnect behavior over unstable links. For Nginx:
+
+```nginx
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_session_cache shared:SSL:10m;
+ssl_session_timeout 1d;
+ssl_session_tickets on;
+```
+
+(wan-tuning-tcp)=
+
+### Host TCP tuning
+
+On lossy long-distance paths, the BBR congestion-control algorithm frequently
+achieves higher and more stable throughput than the Linux default. On the host
+running the reverse proxy (this affects all traffic the host sends toward
+clients), BBR can be enabled with:
+
+```bash
+# /etc/sysctl.d/99-bbr.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+```
+
+Apply with `sysctl --system` and verify with
+`sysctl net.ipv4.tcp_congestion_control`. As with any kernel-level network
+change, test under your own conditions before rolling out broadly.
+
+:::{important}
+Keep the anti-buffering settings described earlier (`proxy_buffering off` for
+Nginx, `flushpackets=on` for Apache) in place. Buffering both adds latency and
+breaks Guacamole's HTTP tunnel, and none of the tuning above removes that
+requirement.
+:::
+
