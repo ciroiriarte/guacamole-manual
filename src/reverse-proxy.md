@@ -506,9 +506,17 @@ in seconds), and optionally raise the global `ProxyTimeout`:
 
 :::{important}
 Guacamole's own ping traffic keeps the connection alive while a session is
-*active*, but it cannot keep it alive across an idle screen indefinitely. Set
-the proxy idle timeout to at least the longest idle session you want to
-survive; otherwise the proxy, not Guacamole, decides when the session drops.
+*active*, so raising these timeouts primarily protects sessions that are
+genuinely idle — for example a backgrounded browser tab, where the browser
+throttles the client's ping timers and the tunnel really does fall silent.
+Treat this as proxy *hygiene* and idle-session protection, **not** as a cure
+for mid-session disconnects of *active* sessions: because an active tunnel
+carries a ping roughly twice per second, those disconnects usually originate
+elsewhere — a transient WAN stall tripping the client's own receive timeout, an
+edge reset, or browser tab throttling — rather than from proxy idle timeout.
+Still, set the proxy idle timeout to at least the longest idle session you want
+to survive; otherwise the proxy, not Guacamole, decides when an idle session
+drops.
 :::
 
 (wan-tuning-compression)=
@@ -516,9 +524,14 @@ survive; otherwise the proxy, not Guacamole, decides when the session drops.
 ### WebSocket compression
 
 The data carried over the Guacamole tunnel is a stream of text instructions
-that compresses very well, so compression can substantially reduce the volume
-of data crossing the WAN. Two points are important when a reverse proxy is
-involved:
+that compresses well, so compression *can* reduce the volume of data crossing
+the WAN. Treat this as an optional optimization rather than a priority: it
+trades CPU on both ends for bandwidth, much of the heaviest tunnel content
+(images) is already encoded and compresses little further, and on the
+high-latency or lossy links this section targets, throughput is rarely the
+bottleneck — round-trip time and packet loss are. Measure the actual bytes
+saved and the CPU cost before enabling it in production. Two points are
+important when a reverse proxy is involved:
 
 1. Compression of the tunnel happens at the *WebSocket* layer, using the
    `permessage-deflate` extension negotiated between the browser and the
@@ -613,4 +626,50 @@ Nginx, `flushpackets=on` for Apache) in place. Buffering both adds latency and
 breaks Guacamole's HTTP tunnel, and none of the tuning above removes that
 requirement.
 :::
+
+(wan-tuning-diagnostics)=
+
+### Diagnosing WAN loss and latency
+
+When users report intermittent disconnects or sluggishness over a WAN link, the
+browser alone cannot tell you whether packet loss is to blame — a WebSocket runs
+over TCP, which retransmits lost segments transparently, so at the application
+layer loss shows up only indirectly, as latency spikes and brief stalls. The
+authoritative packet-loss and retransmit figures live on the proxy host.
+
+On the reverse-proxy host, inspect the live sockets and interface counters:
+
+```bash
+# Per-socket RTT, jitter, congestion window, and retransmits
+ss -ti
+
+# Cumulative TCP retransmits, resets, and failed connection attempts
+netstat -s | grep -iE 'retrans|reset|failed'
+```
+
+A steadily climbing *segments retransmitted* count, or non-zero `retrans`/`lost`
+on established Guacamole sockets in `ss -ti`, indicates real loss on the path —
+distinct from a merely high but stable RTT. If Guacamole is fronted by a CDN
+such as Cloudflare, its edge analytics (request latency, WebSocket close codes,
+error rates) provide a complementary view from the client side of the WAN. Use
+these server- and edge-side signals together with the browser's own latency
+reporting to attribute a problem to loss, latency, or an idle-timeout close.
+
+(wan-tuning-keepalive)=
+
+### Keeping idle sessions alive
+
+Raising the proxy idle timeout (above) stops the *proxy* from closing a quiet
+tunnel too early, but if a CDN or other intermediary enforces its own idle
+timeout that you cannot raise (Cloudflare, for instance, closes proxied
+WebSockets after roughly 100 seconds of inactivity on non-Enterprise plans), a
+*genuinely* idle session — a backgrounded tab, or a static remote screen with no
+protocol activity — can still be cut at that outer edge.
+
+The robust remedy is to ensure an idle tunnel still carries periodic traffic
+below the shortest idle timeout in the path, via a protocol-level keepalive on
+the remote connection (for example, RDP or VNC keepalive) so the remote desktop
+itself emits periodic updates. Where an idle-timeout close is unavoidable, the
+client's ability to reconnect and resume the session gracefully matters more
+than any timeout value; see the connection settings for your protocol.
 
